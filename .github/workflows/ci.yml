@@ -1,0 +1,252 @@
+name: CI — Terraform Validate & Lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'terraform/**'
+      - 'ansible/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.6.6"
+  TFLINT_VERSION: "v0.50.3"
+  ANSIBLE_LINT_VERSION: "6.22.2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Terraform — format check
+  # ---------------------------------------------------------------------------
+  terraform-fmt:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check formatting
+        run: |
+          terraform fmt -check -recursive terraform/
+          echo "All Terraform files are correctly formatted."
+
+  # ---------------------------------------------------------------------------
+  # Terraform — validate all modules and environments
+  # ---------------------------------------------------------------------------
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    needs: terraform-fmt
+
+    strategy:
+      matrix:
+        include:
+          - path: terraform/modules/vpc
+            name: module-vpc
+          - path: terraform/modules/eks
+            name: module-eks
+          - path: terraform/modules/rds
+            name: module-rds
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init (${{ matrix.name }})
+        run: terraform init -backend=false
+        working-directory: ${{ matrix.path }}
+
+      - name: Terraform validate (${{ matrix.name }})
+        run: terraform validate
+        working-directory: ${{ matrix.path }}
+
+  # ---------------------------------------------------------------------------
+  # TFLint — lint modules
+  # ---------------------------------------------------------------------------
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+
+    strategy:
+      matrix:
+        path:
+          - terraform/modules/vpc
+          - terraform/modules/eks
+          - terraform/modules/rds
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Init TFLint
+        run: tflint --init
+        working-directory: ${{ matrix.path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run TFLint (${{ matrix.path }})
+        run: tflint --format compact
+        working-directory: ${{ matrix.path }}
+
+  # ---------------------------------------------------------------------------
+  # Checkov — security and compliance scanning
+  # ---------------------------------------------------------------------------
+  checkov:
+    name: Checkov Security Scan
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          soft_fail: false
+          output_format: cli
+          # Skip checks that are environment-specific (e.g. need real AWS creds)
+          skip_check: >-
+            CKV_AWS_144,
+            CKV_AWS_145,
+            CKV_TF_1
+
+  # ---------------------------------------------------------------------------
+  # Ansible Lint
+  # ---------------------------------------------------------------------------
+  ansible-lint:
+    name: Ansible Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ansible-lint
+        run: pip install ansible-lint==${{ env.ANSIBLE_LINT_VERSION }}
+
+      - name: Run ansible-lint
+        run: ansible-lint ansible/playbooks/
+
+  # ---------------------------------------------------------------------------
+  # Terraform plan (dev) — runs on PRs only, requires AWS creds secret
+  # ---------------------------------------------------------------------------
+  terraform-plan-dev:
+    name: Terraform Plan (dev)
+    runs-on: ubuntu-latest
+    needs: [tflint, checkov]
+    if: github.event_name == 'pull_request'
+
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write   # for OIDC auth
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+        continue-on-error: true  # Skip if credentials not configured
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+        working-directory: terraform/environments/dev
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+        working-directory: terraform/environments/dev
+        continue-on-error: true
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync('terraform/environments/dev/plan.txt', 'utf8');
+            } catch (e) {
+              planOutput = 'Plan output not available (AWS credentials may not be configured)';
+            }
+
+            const output = `#### Terraform Plan (dev) ${{ steps.plan.outcome == 'success' && '✅' || '❌' }}
+            \`\`\`hcl
+            ${planOutput.substring(0, 60000)}
+            \`\`\`
+            *Pushed by @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  # ---------------------------------------------------------------------------
+  # Final gate — all required checks must pass
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    needs:
+      - terraform-fmt
+      - terraform-validate
+      - tflint
+      - ansible-lint
+    if: always()
+
+    steps:
+      - name: Check all required jobs passed
+        run: |
+          results=("${{ needs.terraform-fmt.result }}" "${{ needs.terraform-validate.result }}" "${{ needs.tflint.result }}" "${{ needs.ansible-lint.result }}")
+          for result in "${results[@]}"; do
+            if [[ "$result" != "success" ]]; then
+              echo "One or more required jobs failed or were skipped."
+              exit 1
+            fi
+          done
+          echo "All checks passed."

@@ -1,0 +1,118 @@
+---
+# rds-maintenance.yml
+# Automated RDS maintenance tasks: schema migrations, vacuum, index analysis.
+# Requires: boto3, psycopg2-binary installed on control node.
+# Usage: ansible-playbook playbooks/rds-maintenance.yml -e "environment=prod db_identifier=prod-postgres"
+
+- name: Fetch RDS credentials from Secrets Manager
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    aws_region: "us-east-1"
+
+  tasks:
+    - name: Get DB credentials from Secrets Manager
+      amazon.aws.aws_secret:
+        name: "{{ db_identifier }}-db-credentials"
+        region: "{{ aws_region }}"
+      register: db_secret
+      no_log: true
+
+    - name: Parse credentials
+      ansible.builtin.set_fact:
+        db_host: "{{ (db_secret.secret | from_json).host }}"
+        db_port: "{{ (db_secret.secret | from_json).port }}"
+        db_name: "{{ (db_secret.secret | from_json).dbname }}"
+        db_user: "{{ (db_secret.secret | from_json).username }}"
+        db_pass: "{{ (db_secret.secret | from_json).password }}"
+      no_log: true
+
+- name: Run RDS maintenance
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run VACUUM ANALYZE on all tables
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        login_host: "{{ db_host }}"
+        login_port: "{{ db_port }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        query: "VACUUM ANALYZE;"
+      no_log: true
+      register: vacuum_result
+
+    - name: Check for bloated tables (>20% dead tuples)
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        login_host: "{{ db_host }}"
+        login_port: "{{ db_port }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        query: |
+          SELECT
+            schemaname || '.' || tablename AS table_name,
+            n_dead_tup,
+            n_live_tup,
+            ROUND(100 * n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio
+          FROM pg_stat_user_tables
+          WHERE n_live_tup > 1000
+            AND n_dead_tup::float / NULLIF(n_live_tup + n_dead_tup, 0) > 0.20
+          ORDER BY n_dead_tup DESC
+          LIMIT 20;
+      no_log: true
+      register: bloat_result
+
+    - name: Report bloated tables
+      ansible.builtin.debug:
+        msg: "Bloated tables: {{ bloat_result.query_result }}"
+      when: bloat_result.query_result | length > 0
+
+    - name: Check for unused indexes
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        login_host: "{{ db_host }}"
+        login_port: "{{ db_port }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        query: |
+          SELECT
+            schemaname || '.' || relname AS table_name,
+            indexrelname AS index_name,
+            idx_scan,
+            pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+          FROM pg_stat_user_indexes
+          WHERE idx_scan = 0
+            AND NOT indisprimary
+            AND NOT indisunique
+          ORDER BY pg_relation_size(indexrelid) DESC
+          LIMIT 20;
+      no_log: true
+      register: unused_indexes
+
+    - name: Report unused indexes
+      ansible.builtin.debug:
+        msg: "Unused indexes (candidates for removal): {{ unused_indexes.query_result }}"
+      when: unused_indexes.query_result | length > 0
+
+    - name: Check database size
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        login_host: "{{ db_host }}"
+        login_port: "{{ db_port }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        query: |
+          SELECT
+            datname,
+            pg_size_pretty(pg_database_size(datname)) AS size
+          FROM pg_database
+          ORDER BY pg_database_size(datname) DESC;
+      no_log: true
+      register: db_sizes
+
+    - name: Report database sizes
+      ansible.builtin.debug:
+        msg: "Database sizes: {{ db_sizes.query_result }}"

@@ -1,0 +1,294 @@
+---
+# k8s-node-setup.yml
+# Bootstrap Kubernetes worker nodes on EC2 instances.
+# Installs containerd, kubelet, kubeadm, kubectl, and joins the cluster.
+# Intended for self-managed Kubernetes; not needed for EKS managed nodes.
+#
+# Usage:
+#   ansible-playbook playbooks/k8s-node-setup.yml \
+#     -i inventory/dev \
+#     -e "k8s_version=1.29 cluster_name=dev-us-east-1 env=dev" \
+#     --limit new_nodes
+#
+# Required extra vars:
+#   k8s_version      - Kubernetes version (e.g. "1.29")
+#   join_command     - kubeadm join command (from control plane: kubeadm token create --print-join-command)
+#   env              - Target environment
+
+- name: Kubernetes node bootstrap
+  hosts: k8s_workers
+  gather_facts: true
+  become: true
+  vars:
+    k8s_version: "1.29"
+    containerd_version: "1.7"
+    pod_cidr: "192.168.0.0/16"
+    aws_region: "us-east-1"
+
+  pre_tasks:
+    - name: Verify OS is Ubuntu 22.04 or Amazon Linux 2023
+      ansible.builtin.assert:
+        that:
+          - >
+            (ansible_distribution == "Ubuntu" and ansible_distribution_major_version | int >= 22) or
+            (ansible_distribution == "Amazon" and ansible_distribution_major_version | int >= 2023)
+        fail_msg: "Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Check available memory (minimum 2GB for k8s nodes)
+      ansible.builtin.assert:
+        that:
+          - ansible_memtotal_mb >= 1800
+        fail_msg: "Node has only {{ ansible_memtotal_mb }}MB RAM. Minimum 2GB required."
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # System prerequisites
+    # -------------------------------------------------------------------------
+    - name: Update apt cache (Ubuntu)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install base system packages (Ubuntu)
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - socat
+          - conntrack
+          - ipset
+          - ipvsadm
+          - jq
+          - unzip
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Install base system packages (Amazon Linux)
+      ansible.builtin.dnf:
+        name:
+          - curl
+          - gnupg
+          - socat
+          - conntrack
+          - ipset
+          - ipvsadm
+          - jq
+          - unzip
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    # -------------------------------------------------------------------------
+    # Disable swap (required by kubelet)
+    # -------------------------------------------------------------------------
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+
+    - name: Remove swap entries from /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        replace: '# \1'
+
+    # -------------------------------------------------------------------------
+    # Kernel modules and sysctl settings
+    # -------------------------------------------------------------------------
+    - name: Load required kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Persist kernel modules across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Configure sysctl for Kubernetes networking
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { name: "net.bridge.bridge-nf-call-iptables",  value: "1" }
+        - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { name: "net.ipv4.ip_forward",                 value: "1" }
+
+    # -------------------------------------------------------------------------
+    # Install containerd
+    # -------------------------------------------------------------------------
+    - name: Add Docker apt repository (Ubuntu — containerd source)
+      block:
+        - name: Download Docker GPG key
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: /etc/apt/keyrings/docker.asc
+            mode: "0644"
+
+        - name: Add Docker repository
+          ansible.builtin.apt_repository:
+            repo: >
+              deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+              signed-by=/etc/apt/keyrings/docker.asc]
+              https://download.docker.com/linux/ubuntu
+              {{ ansible_distribution_release }} stable
+            filename: docker
+            state: present
+
+        - name: Install containerd
+          ansible.builtin.apt:
+            name: "containerd.io"
+            state: present
+            update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install containerd (Amazon Linux)
+      ansible.builtin.dnf:
+        name: containerd
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Generate default containerd config
+      ansible.builtin.command: containerd config default
+      register: containerd_default_config
+      changed_when: false
+
+    - name: Write containerd config
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_default_config.stdout }}"
+        mode: "0644"
+      notify: Restart containerd
+
+    - name: Enable SystemdCgroup in containerd config
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: Restart containerd
+
+    - name: Enable and start containerd
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # -------------------------------------------------------------------------
+    # Install Kubernetes components
+    # -------------------------------------------------------------------------
+    - name: Add Kubernetes apt repo (Ubuntu)
+      block:
+        - name: Download Kubernetes apt GPG key
+          ansible.builtin.get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key"
+            dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+            mode: "0644"
+
+        - name: Add Kubernetes apt repository
+          ansible.builtin.apt_repository:
+            repo: >
+              deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc]
+              https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
+            filename: kubernetes
+            state: present
+
+        - name: Install kubelet, kubeadm, kubectl
+          ansible.builtin.apt:
+            name:
+              - "kubelet"
+              - "kubeadm"
+              - "kubectl"
+            state: present
+            update_cache: true
+
+        - name: Hold k8s packages at current version
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubeadm
+            - kubectl
+      when: ansible_os_family == "Debian"
+
+    - name: Enable and start kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+        state: started
+
+    # -------------------------------------------------------------------------
+    # Node labels and configuration
+    # -------------------------------------------------------------------------
+    - name: Set kubelet node labels via environment file
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS=--node-labels=env={{ env }},managed-by=ansible
+        mode: "0644"
+      notify: Restart kubelet
+
+    # -------------------------------------------------------------------------
+    # Join the cluster
+    # -------------------------------------------------------------------------
+    - name: Check if node is already joined to a cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join node to Kubernetes cluster
+      ansible.builtin.command: "{{ join_command }}"
+      when:
+        - not kubelet_conf.stat.exists
+        - join_command is defined
+        - join_command | length > 0
+      changed_when: true
+      no_log: true  # join_command contains a token
+
+    # -------------------------------------------------------------------------
+    # Post-join verification
+    # -------------------------------------------------------------------------
+    - name: Wait for kubelet to be active
+      ansible.builtin.systemd:
+        name: kubelet
+      register: kubelet_status
+      retries: 12
+      delay: 5
+      until: kubelet_status.status.ActiveState == "active"
+
+    - name: Gather node facts
+      ansible.builtin.setup:
+        gather_subset:
+          - network
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+
+  post_tasks:
+    - name: Print node join summary
+      ansible.builtin.debug:
+        msg: |
+          Node {{ inventory_hostname }} ({{ ansible_default_ipv4.address }}) bootstrapped.
+          Kubernetes {{ k8s_version }} — containerd runtime.
+          Run 'kubectl get nodes' on the control plane to confirm.

@@ -1,0 +1,225 @@
+---
+# app-deploy.yml
+# Rolling deploy of a containerised application to EKS or EC2.
+# Supports both Kubernetes (via kubectl) and direct EC2 deployments.
+#
+# Usage:
+#   ansible-playbook playbooks/app-deploy.yml \
+#     -i inventory/prod \
+#     -e "app_name=api-server app_version=v1.2.3 env=prod"
+#
+# Required extra vars:
+#   app_name     - Name of the application (matches ECR repo and k8s deployment)
+#   app_version  - Docker image tag to deploy
+#   env          - Target environment (dev, staging, prod)
+#
+# Optional extra vars:
+#   deploy_target   - "kubernetes" or "ec2" (default: kubernetes)
+#   ecr_registry    - ECR registry URL (default: from group_vars)
+#   namespace       - Kubernetes namespace (default: default)
+#   max_unavailable - Max unavailable pods during rolling update (default: 1)
+#   dry_run         - Set to "yes" to do a dry-run (default: no)
+
+- name: Pre-deploy validation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_target: "kubernetes"
+    namespace: "default"
+    dry_run: "no"
+    max_unavailable: 1
+
+  tasks:
+    - name: Validate required variables are set
+      ansible.builtin.assert:
+        that:
+          - app_name is defined
+          - app_version is defined
+          - env is defined
+        fail_msg: "Required variables missing: app_name, app_version, env"
+
+    - name: Confirm deployment details
+      ansible.builtin.debug:
+        msg: |
+          Deploying:
+            App:         {{ app_name }}
+            Version:     {{ app_version }}
+            Environment: {{ env }}
+            Target:      {{ deploy_target }}
+            Namespace:   {{ namespace }}
+            Dry run:     {{ dry_run }}
+
+    - name: Check kubectl is available (for kubernetes deploys)
+      ansible.builtin.command: kubectl version --client --short
+      register: kubectl_check
+      changed_when: false
+      failed_when: kubectl_check.rc != 0
+      when: deploy_target == "kubernetes"
+
+    - name: Verify ECR image exists
+      ansible.builtin.command: >
+        aws ecr describe-images
+          --repository-name {{ app_name }}
+          --image-ids imageTag={{ app_version }}
+          --region {{ aws_region | default('us-east-1') }}
+      register: ecr_check
+      changed_when: false
+      failed_when: ecr_check.rc != 0
+
+    - name: Authenticate with ECR
+      ansible.builtin.command: >
+        aws ecr get-login-password
+          --region {{ aws_region | default('us-east-1') }}
+      register: ecr_password
+      changed_when: false
+      no_log: true
+
+- name: Kubernetes rolling deployment
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_target: "kubernetes"
+    namespace: "default"
+    dry_run: "no"
+    max_unavailable: 1
+  when: deploy_target == "kubernetes"
+
+  tasks:
+    - name: Update deployment image tag
+      ansible.builtin.command: >
+        kubectl set image deployment/{{ app_name }}
+          {{ app_name }}={{ ecr_registry }}/{{ app_name }}:{{ app_version }}
+          --namespace={{ namespace }}
+          {{ '--dry-run=client' if dry_run == 'yes' else '' }}
+      register: deploy_result
+      changed_when: "'image updated' in deploy_result.stdout"
+
+    - name: Patch max unavailable
+      ansible.builtin.command: >
+        kubectl patch deployment {{ app_name }}
+          --namespace={{ namespace }}
+          -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":{{ max_unavailable }}}}}}'
+      when: dry_run != "yes"
+      changed_when: true
+
+    - name: Wait for rollout to complete
+      ansible.builtin.command: >
+        kubectl rollout status deployment/{{ app_name }}
+          --namespace={{ namespace }}
+          --timeout=300s
+      register: rollout_status
+      changed_when: false
+      when: dry_run != "yes"
+
+    - name: Verify pods are running
+      ansible.builtin.command: >
+        kubectl get pods
+          --namespace={{ namespace }}
+          -l app={{ app_name }}
+          --field-selector=status.phase=Running
+          -o jsonpath='{.items[*].metadata.name}'
+      register: running_pods
+      changed_when: false
+      when: dry_run != "yes"
+
+    - name: Show running pods
+      ansible.builtin.debug:
+        msg: "Running pods: {{ running_pods.stdout.split() }}"
+      when: dry_run != "yes"
+
+    - name: Smoke test — check app health endpoint
+      ansible.builtin.uri:
+        url: "{{ health_check_url | default('http://localhost:8080/health') }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_check
+      retries: 5
+      delay: 10
+      until: health_check.status == 200
+      when: dry_run != "yes" and health_check_url is defined
+
+- name: EC2 rolling deployment
+  hosts: "{{ app_name }}_{{ env }}"
+  serial: 1  # One host at a time for rolling updates
+  gather_facts: true
+  become: true
+  vars:
+    deploy_target: "ec2"
+    deploy_dir: "/opt/{{ app_name }}"
+    service_name: "{{ app_name }}"
+    dry_run: "no"
+
+  when: deploy_target == "ec2"
+
+  pre_tasks:
+    - name: Ensure deploy directory exists
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        owner: "{{ app_user | default('ubuntu') }}"
+        group: "{{ app_user | default('ubuntu') }}"
+        mode: "0755"
+
+  tasks:
+    - name: Pull new Docker image
+      community.docker.docker_image:
+        name: "{{ ecr_registry }}/{{ app_name }}"
+        tag: "{{ app_version }}"
+        source: pull
+        force_source: true
+      when: dry_run != "yes"
+
+    - name: Update docker-compose image tag
+      ansible.builtin.lineinfile:
+        path: "{{ deploy_dir }}/docker-compose.yml"
+        regexp: "image: {{ ecr_registry }}/{{ app_name }}:.*"
+        line: "      image: {{ ecr_registry }}/{{ app_name }}:{{ app_version }}"
+        backrefs: true
+      when: dry_run != "yes"
+
+    - name: Stop the old container gracefully
+      ansible.builtin.command: >
+        docker-compose -f {{ deploy_dir }}/docker-compose.yml stop {{ app_name }}
+      when: dry_run != "yes"
+      changed_when: true
+
+    - name: Start new container
+      ansible.builtin.command: >
+        docker-compose -f {{ deploy_dir }}/docker-compose.yml up -d {{ app_name }}
+      when: dry_run != "yes"
+      changed_when: true
+
+    - name: Wait for container to be healthy
+      ansible.builtin.command: >
+        docker inspect --format="{{ '{{' }}.State.Health.Status{{ '}}' }}" {{ app_name }}
+      register: container_health
+      retries: 12
+      delay: 5
+      until: container_health.stdout == "healthy"
+      changed_when: false
+      when: dry_run != "yes"
+
+  post_tasks:
+    - name: Remove old Docker images to free disk space
+      community.docker.docker_prune:
+        images: true
+        images_filters:
+          dangling: true
+      when: dry_run != "yes"
+
+- name: Post-deploy summary
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Print deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          Deployment complete
+          App:         {{ app_name }}
+          Version:     {{ app_version }}
+          Environment: {{ env }}
+          Time:        {{ ansible_date_time.iso8601 | default('N/A') }}
+          ============================================================

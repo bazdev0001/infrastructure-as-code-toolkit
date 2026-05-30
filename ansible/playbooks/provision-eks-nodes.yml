@@ -1,0 +1,82 @@
+---
+# provision-eks-nodes.yml
+# Post-join EKS node configuration: installs monitoring agents,
+# configures log forwarders, kernel tuning, and security hardening.
+# Run via: ansible-playbook -i inventory/aws_ec2.yml playbooks/provision-eks-nodes.yml
+
+- name: Configure EKS worker nodes
+  hosts: tag_kubernetes_io_cluster_name_eks:&tag_aws_eks_nodegroup
+  become: true
+  gather_facts: true
+
+  vars:
+    node_exporter_version: "1.7.0"
+    fluent_bit_version: "3.0.4"
+    kernel_tuning_params:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65535
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_fin_timeout: 15
+      vm.max_map_count: 262144
+      fs.file-max: 1000000
+      kernel.pid_max: 4194304
+
+  pre_tasks:
+    - name: Wait for system to become reachable
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+
+    - name: Gather facts after connection
+      ansible.builtin.setup:
+
+  roles:
+    - role: kernel-tuning
+      vars:
+        sysctl_params: "{{ kernel_tuning_params }}"
+
+    - role: security-hardening
+
+    - role: node-exporter
+      vars:
+        version: "{{ node_exporter_version }}"
+
+    - role: fluent-bit
+      vars:
+        version: "{{ fluent_bit_version }}"
+        log_destinations:
+          - type: cloudwatch
+            log_group: "/aws/eks/{{ cluster_name }}/application"
+            region: "{{ aws_region }}"
+
+  tasks:
+    - name: Ensure ulimits are configured for container workloads
+      ansible.builtin.pam_limits:
+        domain: "*"
+        limit_type: "{{ item.type }}"
+        limit_item: "{{ item.item }}"
+        value: "{{ item.value }}"
+      loop:
+        - { type: soft, item: nofile, value: 1048576 }
+        - { type: hard, item: nofile, value: 1048576 }
+        - { type: soft, item: nproc, value: unlimited }
+        - { type: hard, item: nproc, value: unlimited }
+
+    - name: Configure logrotate for container logs
+      ansible.builtin.template:
+        src: templates/logrotate-containers.j2
+        dest: /etc/logrotate.d/containers
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Verify node is joined to the cluster
+      ansible.builtin.command: kubectl get node "{{ inventory_hostname_short }}"
+      delegate_to: localhost
+      become: false
+      register: node_status
+      changed_when: false
+      failed_when: "'NotReady' in node_status.stdout or node_status.rc != 0"
+
+    - name: Report node status
+      ansible.builtin.debug:
+        msg: "Node {{ inventory_hostname_short }} is {{ 'Ready' if 'Ready' in node_status.stdout else 'Unknown' }}"
